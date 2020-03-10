@@ -152,7 +152,11 @@ To have access to the Bucket informations you will all need the following permis
 There are no installations required, just download the script and run. 
 
 If you decide to run inside docker you can build it with the provided Dockerfile
-I used: DOCKER_BUILDKIT=1 docker build -t coveo-challenge .
+I used: 
+
+```
+DOCKER_BUILDKIT=1 docker build -t coveo-challenge .
+```
 
 ## Running examples
 
