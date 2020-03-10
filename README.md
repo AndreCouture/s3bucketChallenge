@@ -210,7 +210,7 @@ python3 s3bucketstats.py -l 'mybucket' -k '/Folder/SubFolder/log' -s 3
 If you want to run via docker you will need to mount your ~/.aws folder to the container in order to get credentials
 Here is what I use on my MacOS
 ```
-docker container run --mount type=bind,source=$(echo ~)/.aws,target=/root/.aws,readonly -it -e AWS_PROFILE=default -v /tmp:/output coveo-challenge -l '.*' -o /output/docker-run-output.json 
+docker container run --mount type=bind,source=$(echo ~)/.aws,target=/root/.aws,readonly -it -e AWS_PROFILE=default -v $(pwd):/output coveo-challenge -l '.*' -o /output/docker-run-output.json 
 ```
 This will mount my home .aws folder ~/.aws to the root user in the container.
 I then specify which profile to use
