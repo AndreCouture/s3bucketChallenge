@@ -147,6 +147,42 @@ To have access to the Bucket informations you will all need the following permis
     ]
 }
 ```
+
+Here is a policy that should have the necessary permissions assuming that the inventory is also located within the same bucket;
+
+```
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "VisualEditor0",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetLifecycleConfiguration",
+                "s3:GetObjectRetention",
+                "s3:GetInventoryConfiguration",
+                "ec2:DescribeRegions",
+                "s3:ListBucket",
+                "s3:GetAccelerateConfiguration",
+                "s3:GetReplicationConfiguration",
+                "s3:GetObject",
+                "s3:GetEncryptionConfiguration",
+                "s3:ListAllMyBuckets",
+                "s3:GetAnalyticsConfiguration",
+                "s3:PutBucketPolicy",
+                "pricing:*",
+                "s3:GetBucket*",
+                "s3:GetMetricsConfiguration"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+```
+
+
+
+
 ### Installing
 
 There are no installations required, just download the script and run. 
