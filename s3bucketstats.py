@@ -5,6 +5,7 @@ version 1.0.0
 By Andre Couture
 Coveo Challenge
 '''
+import concurrent
 import csv
 import gzip
 import itertools
@@ -17,21 +18,60 @@ import time
 from argparse import ArgumentParser
 from datetime import timedelta
 from io import BytesIO, StringIO
+from threading import Thread
 
 import boto3
 import pandas as pd
 import requests
 from botocore.config import Config
 
-from threading import Thread
-
 groups_dict = {'REDUCED_REDUNDANCY', 'STANDARD', 'STANDARD_IA'}
 sizes_name = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"]
 csv_columns = ['Bucket', 'Key', 'ETag', 'Size', 'LastModified', 'StorageClass']
 
+def put_inventory_configuration(bucket):
+    s3.put_bucket_inventory_configuration(
+        Bucket=bucket,
+        Id=bucket + "-inventory",
+        InventoryConfiguration={
+            'Destination': {
+                # Put the inventory files into the same bucket.
+                'S3BucketDestination': {
+                    # A bucket ARN rather than a bucket name.
+                    'Bucket': 'arn:aws:s3:::' + bucket,
+                    'Format': 'CSV',
+                    #// Not needed if everything is in the same account.
+                    #// AccountId: '111222333444',
+                    #// Do NOT add a trailing '/' to this prefix; it will be added 
+                    #// by S3 Inventory when creating the keys regardless, and so
+                    #// the key will start with 'inventory//' if you add one here.
+                    'Prefix': 'inventory'
+                }
+            },
+            'Id': bucket + "-inventory",
+            'IncludedObjectVersions': 'All',
+            'IsEnabled': True,
+            'Schedule': {
+            'Frequency': 'Daily'
+            },
+            # Add all the mentioned optional fields.
+            'OptionalFields': [
+                'Size',
+                'LastModifiedDate',
+                'StorageClass',
+                'ETag',
+                'IsMultipartUploaded',
+                'ReplicationStatus',
+                'EncryptionStatus'
+            ]
+        }
+    )
+
+
 global grand_total_objects
 global grand_total_size
 global grand_total_cost
+
 
 class Settings(object):
     def __init__(self):
@@ -47,11 +87,19 @@ class Settings(object):
         self._INVENTORY = None
         self._S3SELECT = None
         self._LOWMEMORY = False
-        self._THREADED = False
+        self._THREADED = 0
+        self._MAX_THREADS = 0
         self._BUCKETS = None
+        self._PUT_INVENTORY = False
+
+    def set_put_inventory(self, value):
+        self._PUT_INVENTORY = value
 
     def set_buckets(self, value):
         self._BUCKETS = value
+
+    def set_maxthreads(self, value):
+        self._MAX_THREADS = value
 
     def set_threaded(self, value):
         self._THREADED = value
@@ -264,8 +312,12 @@ def load_inventory_csv(bucket_name, inventory_ids):
             try:
                 if settings._VERBOSE > 0:
                     print("Using Inventory Id '{}' for bucket '{}'".format(inventory['Id'], bucket_name), end="\r")
-                inventory_manifest = find_latest_inventory_manifest_key(bucket_name, inventory['Bucket'],
+                try:
+                    inventory_manifest = find_latest_inventory_manifest_key(bucket_name, inventory['Bucket'],
                                                                         inventory['Id'])
+                except KeyError:
+                    continue
+
                 if inventory_manifest.__len__() == 0:
                     continue
                 manifest = load_manifest(inventory['Bucket'], inventory_manifest)
@@ -336,7 +388,8 @@ def s3select_inventory_csv(bucket_name, key, cols_names):
     lastmodified_pos = cols_names.index('LastModifiedDate')
     storage_pos = cols_names.index('StorageClass')
     encryption_pos = cols_names.index('EncryptionStatus')
-    expression = "select _{},_{},_{},_{} from s3object".format(size_pos+1,lastmodified_pos+1,storage_pos+1,encryption_pos+1)
+    expression = "select _{},_{},_{},_{} from s3object".format(size_pos + 1, lastmodified_pos + 1, storage_pos + 1,
+                                                               encryption_pos + 1)
     req = s3.select_object_content(
         Bucket=bucket_name,
         Key=key,
@@ -359,7 +412,7 @@ def s3select_inventory_csv(bucket_name, key, cols_names):
     aggr = df.groupby('StorageClass').agg({'StorageClass': 'count', 'Size': 'sum', 'LastModifiedDate': 'max'}).rename(
         columns={'StorageClass': 'Count'}).reset_index()
     if settings._VERBOSE > 4:
-        print(">>>>",aggr)
+        print(">>>>", aggr)
     return aggr
 
 
@@ -396,8 +449,10 @@ def read_inventory_file(bucket_name, key, cols_names):
 
 def add_bool_arg(parser, name, default=False, description=""):
     group = parser.add_mutually_exclusive_group(required=False)
-    group.add_argument("-" + name, dest=name, action="store_true", help=description + (" (DEFAULT) " if default else ""))
-    group.add_argument("-no-" + name, dest=name, action="store_false", help="Do not " + description + (" (DEFAULT) " if not default else ""))
+    group.add_argument("-" + name, dest=name, action="store_true",
+                       help=description + (" (DEFAULT) " if default else ""))
+    group.add_argument("-no-" + name, dest=name, action="store_false",
+                       help="Do not " + description + (" (DEFAULT) " if not default else ""))
     parser.set_defaults(**{name: default})
 
 
@@ -420,7 +475,7 @@ def get_bucket_cost_for_storageclass(bucket_region, storageClass, storageSize):
     return -1
 
 
-def threaded_analyse_bucket_contents(bucket_name, result, i):
+def threaded_analyse_bucket_contents(bucket_name, result=None, i=0):
     processing_start = time.perf_counter()
 
     prefix = settings._KEY_PREFIX
@@ -527,7 +582,16 @@ def threaded_analyse_bucket_contents(bucket_name, result, i):
 
     bucket_processing_time = timedelta(milliseconds=round(1000 * (time.perf_counter() - processing_start)))
 
-    result[i] = bucket_stats, bucket_processing_time
+    if result is not None:
+        result[i] = bucket_stats, bucket_processing_time
+    else:
+        return bucket_stats, bucket_processing_time, "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}{:>40}".format(
+            bucket_stats[0].get('Name'),
+            bucket_stats[0]['CreationDate'],
+            bucket_stats[0]['Count'],
+            bucket_stats[0]['Size'], bucket_stats[0]['LastModified'],
+            bucket_stats[0]['Cost'],
+            str(bucket_processing_time))
 
     print(
         "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}{:>40}".format(bucket_stats[0].get('Name'),
@@ -542,9 +606,9 @@ def threaded_analyse_bucket_contents(bucket_name, result, i):
 def analyse_bucket_contents(bucket_name):
     processing_start = time.perf_counter()
 
-    prefix= settings._KEY_PREFIX
-    delimiter="/"
-    start_after=""
+    prefix = settings._KEY_PREFIX
+    delimiter = "/"
+    start_after = ""
     aggs = []
     if settings._CACHE and os.path.isfile(bucket_name + ".cache"):
         print("Processing via local Cache for bucket {}".format(bucket_name), end="\r")
@@ -554,6 +618,8 @@ def analyse_bucket_contents(bucket_name):
         if inventory != "Disabled" and inventory.__len__() > 0:
             print("Processing via Inventory for bucket {}".format(bucket_name), end="\r")
             aggs = load_inventory_csv(bucket_name, inventory)
+        elif settings._PUT_INVENTORY:
+           put_inventory_configuration(bucket_name)
 
     if aggs.__len__() == 0:
         # at this point we could not find any data from the cache or inventory and we have to revert to listing all objects from the bucket
@@ -640,7 +706,7 @@ def analyse_bucket_contents(bucket_name):
     global grand_total_cost
     global grand_total_size
     global grand_total_objects
-    grand_total_cost += round(bucket_cost,2)
+    grand_total_cost += round(bucket_cost, 2)
     grand_total_objects += bucket_objects
     grand_total_size += bucket_size
 
@@ -674,7 +740,7 @@ def load_aws_pricing(region, vol):
 
             return json.loads(p.get('PriceList')[0])
     except Exception as e:
-        print("EXCEPTION in get_products(region={},vol={}, loc={})".format(region,vol,loc), e)
+        print("EXCEPTION in get_products(region={},vol={}, loc={})".format(region, vol, loc), e)
     return {'terms': {'OnDemand': []}}
 
 
@@ -734,20 +800,31 @@ def get_priceDimensions_for_region_volume(region, volumeType):
 
 
 def set_arguments_parameters(parser):
-    parser.add_argument("-v","--verbose", dest="verbose", required=False, default=1, help="Verbose level, 0 for quiet.")
-    parser.add_argument("-l", "--list-regex", dest="bucket_regex", required=False, default=None, help="Regex to filter which buckets to process. Use '.*' to scan all.")
-    parser.add_argument("-k", "--key-prefix", dest="key_prefix", required=False, default='/', help="Key prefix to filter on, default='/'")
-    parser.add_argument("-r", "--region-regex", dest="region_filter", required=False, default='.*', help="Regex Region filter")
+    parser.add_argument("-v", "--verbose", dest="verbose", required=False, default=1,
+                        help="Verbose level, 0 for quiet.")
+    parser.add_argument("-l", "--list-regex", dest="bucket_regex", required=False, default=None,
+                        help="Regex to filter which buckets to process. Use '.*' to scan all.")
+    parser.add_argument("-k", "--key-prefix", dest="key_prefix", required=False, default='/',
+                        help="Key prefix to filter on, default='/'")
+    parser.add_argument("-r", "--region-regex", dest="region_filter", required=False, default='.*',
+                        help="Regex Region filter")
     parser.add_argument("-o", "--output", dest="output", required=False, default=None, help="Output to File")
-    parser.add_argument("-s", "--display-size", dest="size", type=str, required=False, default="GB", help="Possible values:  [ B | KB | MB | GB | TB | PB | EB | ZB | YB ]")
-    parser.add_argument("-b", "--buckets", dest="buckets", type=str, nargs='+', required=False, default="", help="List of specific buckets to scan. Multiple seperated by space")
+    parser.add_argument("-s", "--display-size", dest="size", type=str, required=False, default="GB",
+                        help="Possible values:  [ B | KB | MB | GB | TB | PB | EB | ZB | YB ]")
+    parser.add_argument("-b", "--buckets", dest="buckets", type=str, nargs='+', required=False, default="",
+                        help="List of specific buckets to scan. Multiple seperated by space")
+    parser.add_argument("-t", "--thread-type", dest="threaded", type=int, required=False, default=1,
+                        help="Thread type, 0 to disable, 1 for Process (Default), 2 for Pool")
+    parser.add_argument("-m", "--max-threads", dest="maxthreads", type=int, required=False, default=1,
+                        help="Max number of pool threads")
+    parser.add_argument("-i", "--put-inventory", dest="put_inventory", action="store_true", required=False, default=False, help="Add inventory if not exist")
 
     add_bool_arg(parser, "cache", False, "Use Cache file if available")
     add_bool_arg(parser, "refresh", False, "Force Refresh Cache")
     add_bool_arg(parser, "inventory", True, "Use Inventory if exist")
     add_bool_arg(parser, "s3select", True, "Use S3 Select to parse inventory result files")
     add_bool_arg(parser, "lowmemory", False, "If you have low memory.")
-    add_bool_arg(parser, "threaded", True, "Use Multi-Thread.")
+    # add_bool_arg(parser, "threaded", True, "Use Multi-Thread.")
 
     arguments = parser.parse_args()
 
@@ -758,12 +835,15 @@ def set_arguments_parameters(parser):
     if arguments.key_prefix: settings.set_key_prefix(arguments.key_prefix)
     if arguments.output is not None: settings.set_output_file(arguments.output)
 
+    if arguments.put_inventory: settings.set_put_inventory(arguments.put_inventory)
+
     settings.set_refresh_cache(arguments.refresh)
     settings.set_cache(arguments.cache)
     settings.set_inventory(arguments.inventory)
     settings.set_s3select(arguments.s3select)
     settings.set_lowmemory(arguments.lowmemory)
     settings.set_threaded(arguments.threaded)
+    settings.set_maxthreads(arguments.maxthreads)
 
     settings.set_display_size(sizes_name.index(arguments.size))
 
@@ -782,8 +862,8 @@ if __name__ == "__main__":
         s3 = boto3.client('s3')
         buckets = s3.list_buckets()
     except Exception as e:
-       print("Try setting the environment variables AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN")
-       exit(1)
+        print("Try setting the environment variables AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN")
+        exit(1)
 
     buckets_stats_array = []
     bucket_list = []
@@ -811,7 +891,7 @@ if __name__ == "__main__":
                                                              "Cost (USD)", "Processing Time"), file=sys.stderr)
     buckets = []
 
-    if settings._THREADED:
+    if settings._THREADED == 1:
         buckets_results = [{} for i in bucket_list]
         threads = []
 
@@ -825,6 +905,22 @@ if __name__ == "__main__":
             if len(bucket) > 0:
                 object = bucket[0]
                 buckets_stats_array.extend(object)
+
+    elif settings._THREADED == 2:
+        # We can use a with statement to ensure threads are cleaned up promptly
+        with concurrent.futures.ThreadPoolExecutor(max_workers=settings._MAX_THREADS) as executor:
+            # Start the load operations and mark each future with its URL
+            future_to_url = {executor.submit(threaded_analyse_bucket_contents, bucket_name): bucket_name for bucket_name
+                             in bucket_list}
+            for future in concurrent.futures.as_completed(future_to_url):
+                bucket_info = future_to_url[future]
+                try:
+                    data, processingtime, info = future.result()
+                except Exception as exc:
+                    print('%r generated an exception: %s' % (bucket_info, exc))
+                else:
+                    buckets_stats_array.extend(data)
+                    print(info)
 
     else:
         for bucket_name in bucket_list:
@@ -843,7 +939,8 @@ if __name__ == "__main__":
                 object = bucket[0]
                 timing = bucket[1]
                 print(
-                    "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}".format(bucket_name, object[0]['CreationDate'], object[0]['Count'],
+                    "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}".format(bucket_name, object[0]['CreationDate'],
+                                                                 object[0]['Count'],
                                                                  object[0]['Size'], object[0]['LastModified'],
                                                                  object[0]['Cost']), file=sys.stderr,
                     end="\r")
@@ -854,7 +951,7 @@ if __name__ == "__main__":
                                                                        object[0]['Size'], object[0]['LastModified'],
                                                                        object[0]["Cost"],
                                                                        str(timing)
-                                                                       #str(timedelta(milliseconds=round(1000 * (time.perf_counter() - start))))
+                                                                       # str(timedelta(milliseconds=round(1000 * (time.perf_counter() - start))))
                                                                        ),
                     file=sys.stderr)
                 if settings._VERBOSE > 1:
@@ -867,15 +964,14 @@ if __name__ == "__main__":
     if settings._VERBOSE > 0:
         print(all_buckets_stats)
 
-    print("Grand Total:\n"\
-          "  Total Buckets:   {:>40}\n"\
-          "  Total Objects:   {:>40}\n"\
-          "  Total Size:      {:>40}\n"\
-          "  Total Cost:      {:>40}\n"\
+    print("Grand Total:\n" \
+          "  Total Buckets:   {:>40}\n" \
+          "  Total Objects:   {:>40}\n" \
+          "  Total Size:      {:>40}\n" \
+          "  Total Cost:      {:>40}\n" \
           "  Processing Time: {:>40}"
-          .format(
-            len(all_buckets_stats['Buckets']),
-            grand_total_objects, display_size(grand_total_size), "${:,.2f}".format(grand_total_cost),
-            str(timedelta(milliseconds=round(1000 * (time.perf_counter() - realstart))))
-        ), file=sys.stderr)
-
+        .format(
+        len(all_buckets_stats['Buckets']),
+        grand_total_objects, display_size(grand_total_size), "${:,.2f}".format(grand_total_cost),
+        str(timedelta(milliseconds=round(1000 * (time.perf_counter() - realstart))))
+    ), file=sys.stderr)
