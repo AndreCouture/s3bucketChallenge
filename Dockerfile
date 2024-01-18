@@ -1,4 +1,4 @@
-FROM python:3.8-slim-buster
+FROM python:3.13.0a2-slim
 
 COPY s3bucketstats.py /
 RUN chmod +x /s3bucketstats.py
